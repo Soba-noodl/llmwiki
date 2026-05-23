@@ -79,7 +79,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     content,
     content='document_chunks',
     content_rowid='rowid',
-    tokenize='porter unicode61'
+    tokenize='trigram'
 );
 
 -- Keep FTS in sync with document_chunks
