@@ -28,7 +28,7 @@ IGNORE_DIRS = frozenset({
 })
 
 TEXT_EXTENSIONS = frozenset({
-    "md", "txt", "csv", "html", "svg", "json", "xml", "yaml", "yml",
+    "md", "txt", "csv", "svg", "json", "xml", "yaml", "yml",
     "toml", "ini", "cfg", "rst", "tex", "latex",
 })
 
