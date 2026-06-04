@@ -111,8 +111,36 @@ def cmd_init(workspace: str) -> None:
     print(f"  .llmwiki/index.db — created")
 
 
+def _store_chunks_sync(conn, document_id: str, content) -> int:
+    """Chunk a document's text and insert into `document_chunks` (the FTS
+    layer `chunks_fts` is kept in sync by triggers). The sync counterpart of
+    `services.chunker.store_chunks_sqlite` for the raw sqlite3 connection used
+    by reindex / index-new / backfill — without this, documents are registered
+    but NOT searchable. Fully guarded: a chunk failure never aborts indexing.
+    Returns the number of chunks written."""
+    if not content or not str(content).strip():
+        return 0
+    try:
+        from services.chunker import chunk_text
+        chunks = chunk_text(content)
+        if not chunks:
+            return 0
+        conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (document_id,))
+        conn.executemany(
+            "INSERT INTO document_chunks "
+            "(document_id, chunk_index, content, page, start_char, token_count, header_breadcrumb) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(document_id, c.index, c.content, c.page, c.start_char, c.token_count, c.header_breadcrumb)
+             for c in chunks],
+        )
+        return len(chunks)
+    except Exception as e:
+        print(f"  Warning: could not chunk {document_id}: {e}", file=sys.stderr)
+        return 0
+
+
 def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> None:
-    """Index existing files in the workspace into SQLite."""
+    """Index existing files in the workspace into SQLite (documents + chunks)."""
     import hashlib
     import uuid
     import sqlite3
@@ -179,6 +207,9 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
                      content_hash, int(stat.st_mtime_ns)),
                 )
                 indexed += 1
+                # Chunk text docs so they are actually SEARCHABLE (chunks_fts),
+                # not merely registered in `documents`.
+                _store_chunks_sync(conn, doc_id, content)
             except Exception as e:
                 print(f"  Warning: could not index {relative}: {e}", file=sys.stderr)
 
@@ -340,6 +371,38 @@ def cmd_index_new(workspace: str) -> None:
     print(f"✓ Incrementally indexed new files in: {ws}")
 
 
+def cmd_backfill_chunks(workspace: str) -> None:
+    """Chunk already-registered documents that have text content but NO chunks
+    (e.g. indexed by an older reindex/index-new that didn't chunk). Reads
+    content straight from the `documents` table — no filesystem walk — so it's
+    fast. Makes existing documents searchable without a full rebuild.
+    """
+    ws = Path(workspace).resolve()
+    db_path = ws / ".llmwiki" / "index.db"
+    if not db_path.exists():
+        print(f"No index found. Run: llmwiki init {ws}", file=sys.stderr)
+        sys.exit(1)
+
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute(
+        "SELECT id, content FROM documents d "
+        "WHERE content IS NOT NULL AND length(trim(content)) > 0 "
+        "AND NOT EXISTS (SELECT 1 FROM document_chunks c WHERE c.document_id = d.id)"
+    ).fetchall()
+
+    docs = 0
+    total = 0
+    for doc_id, content in rows:
+        n = _store_chunks_sync(conn, doc_id, content)
+        if n:
+            docs += 1
+            total += n
+    conn.commit()
+    conn.close()
+    print(f"✓ Backfilled chunks for {docs} document(s) ({total} chunks)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="llmwiki",
@@ -369,6 +432,9 @@ def main():
     p_index_new = sub.add_parser("index-new", help="Incrementally index only new (not-yet-indexed) files — cheap, no full rebuild")
     p_index_new.add_argument("workspace", help="Path to workspace folder")
 
+    p_backfill = sub.add_parser("backfill-chunks", help="Chunk already-registered docs that have content but no chunks (makes them searchable; no FS walk)")
+    p_backfill.add_argument("workspace", help="Path to workspace folder")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -389,6 +455,8 @@ def main():
         cmd_reindex(args.workspace)
     elif args.command == "index-new":
         cmd_index_new(args.workspace)
+    elif args.command == "backfill-chunks":
+        cmd_backfill_chunks(args.workspace)
 
 
 if __name__ == "__main__":
