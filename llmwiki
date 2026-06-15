@@ -10,6 +10,11 @@ Usage:
     llmwiki reindex <workspace>      Force full rebuild of index.db
 """
 
+# PEP 604 unions (e.g. `str | None`) are used in annotations; defer annotation
+# evaluation so the CLI also runs on the macOS system Python 3.9 (shebang
+# `env python3`), not only 3.10+.
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -24,6 +29,24 @@ REPO_ROOT = Path(__file__).resolve().parent
 API_DIR = REPO_ROOT / "api"
 MCP_DIR = REPO_ROOT / "mcp"
 WEB_DIR = REPO_ROOT / "web"
+
+# Re-exec under the api/ venv interpreter when not already running inside it.
+# The shebang (`env python3`) may resolve to a system/Homebrew Python that lacks
+# the venv-only deps (asyncpg, tiktoken, …) that `services.chunker` imports — so
+# reindex/index-new/backfill could register documents but silently fail to CHUNK
+# them, leaving the FTS layer empty and the workspace unsearchable. Detect the
+# venv via sys.prefix (robust to interpreter symlink aliasing) and re-exec.
+# Guarded: a missing venv falls back to the current interpreter (indexing still
+# works; chunking warns).
+_VENV_DIR = API_DIR / ".venv"
+_VENV_PY = _VENV_DIR / "bin" / "python"
+if _VENV_PY.exists() and Path(sys.prefix).resolve() != _VENV_DIR.resolve():
+    os.execv(str(_VENV_PY), [str(_VENV_PY), os.path.realpath(__file__), *sys.argv[1:]])
+
+# services.chunker lives under api/ — put it on the import path so chunking works
+# regardless of the caller's cwd.
+if str(API_DIR) not in sys.path:
+    sys.path.insert(0, str(API_DIR))
 
 
 def _sanitize_name(name: str) -> str:
