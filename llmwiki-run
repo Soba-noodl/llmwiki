@@ -1,0 +1,9 @@
+#!/bin/bash
+# Wrapper for llmwiki that uses the venv Python, sets DYLD_LIBRARY_PATH for
+# the Homebrew expat workaround, and adds mcp/ to PYTHONPATH so the
+# `llmwiki mcp` subcommand can find local_server.
+# Usage: ./llmwiki-run <command> <args>
+export DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib
+export PYTHONPATH=/Users/andreadeiturbe/tools/llmwiki/mcp${PYTHONPATH:+:$PYTHONPATH}
+exec /Users/andreadeiturbe/tools/llmwiki/api/.venv/bin/python \
+     /Users/andreadeiturbe/tools/llmwiki/llmwiki "$@"
