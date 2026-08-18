@@ -24,6 +24,71 @@ _DOC_COLUMNS = (
 )
 
 
+# SQLite FTS5's trigram tokenizer indexes three-character sequences, so any term
+# shorter than three characters matches nothing at all. Latin words are almost
+# always longer, which hides the limit; two-character compounds are the commonest
+# word form in Japanese, so a query like 剣道 or 柳生 silently returns zero hits
+# over a corpus full of them. When no term in the query is long enough to reach
+# the index, scan the chunk text with LIKE instead of asking FTS5.
+
+_FTS_TRIGRAM_MIN = 3
+
+
+# FTS5 syntax the fallback refuses to reinterpret: a phrase, prefix, column
+# filter or grouping means the caller wants the query language, not a substring
+# scan, so leave it to FTS5 even when every term is short.
+_FTS_SYNTAX = set('"*()^:')
+# NOT and NEAR have no substring equivalent; AND and OR do.
+_FTS_UNSUPPORTED_OPS = {"NOT", "NEAR"}
+
+
+def _short_query_groups(query: str) -> list[list[str]] | None:
+    """OR-groups of AND-ed terms to LIKE-scan, or None when FTS5 can serve the query.
+
+    FTS5 binds AND tighter than OR, so `a b OR c` means `(a AND b) OR c`. Flattening
+    that to a single connective would answer a different question than was asked.
+    """
+    tokens = query.split()
+    if not tokens or any(c in _FTS_SYNTAX for t in tokens for c in t):
+        return None
+    if any(t in _FTS_UNSUPPORTED_OPS for t in tokens):
+        return None
+    # Every AND/OR needs a term on each side. A dangling or doubled operator is a
+    # query error, and FTS5 saying so loudly beats this function guessing quietly.
+    ops = ("AND", "OR")
+    for i, token in enumerate(tokens):
+        if token in ops and (
+            i == 0 or i == len(tokens) - 1
+            or tokens[i - 1] in ops or tokens[i + 1] in ops
+        ):
+            return None
+    groups: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "OR":
+            groups.append([])
+        elif token != "AND":
+            groups[-1].append(token)
+    if any(len(t) >= _FTS_TRIGRAM_MIN for g in groups for t in g):
+        return None
+    return groups
+
+
+def _like_clause(groups: list[list[str]], column: str) -> tuple[str, list[str]]:
+    params: list[str] = []
+    ors = []
+    for group in groups:
+        ands = []
+        for term in group:
+            ands.append(f"{column} LIKE ? ESCAPE '\\'")
+            params.append(
+                "%"
+                + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                + "%"
+            )
+        ors.append(" AND ".join(ands))
+    return "(" + " OR ".join(f"({o})" for o in ors) + ")", params
+
+
 def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:
     cols = [d[0] for d in cursor.description]
     d = dict(zip(cols, row))
@@ -528,23 +593,35 @@ class SQLiteChunkRepository:
         self, kb_id: str, query: str, *, limit: int = 20,
         path_filter: str | None = None, user_id: str | None = None,
     ) -> list[dict]:
+        short_groups = _short_query_groups(query)
+        if short_groups is None:
+            rank_sql = "rank "
+            join_sql = "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+            match_sql = "chunks_fts MATCH ?"
+            order_sql = "ORDER BY rank LIMIT ?"
+            params: list = [query]
+        else:
+            rank_sql = "0.0 AS rank "
+            join_sql = ""
+            match_sql, params = _like_clause(short_groups, "dc.content")
+            order_sql = "ORDER BY dc.chunk_index LIMIT ?"
+
         sql = (
             "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
             "d.filename, d.title, d.path, d.file_type, d.tags, "
-            "rank "
-            "FROM document_chunks dc "
-            "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
-            "JOIN documents d ON dc.document_id = d.id "
-            "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+            + rank_sql
+            + "FROM document_chunks dc "
+            + join_sql
+            + "JOIN documents d ON dc.document_id = d.id "
+            + f"WHERE {match_sql} AND d.status != 'failed' "
         )
-        params: list = [query]
 
         if path_filter == "wiki":
             sql += "AND d.source_kind = 'wiki' "
         elif path_filter == "sources":
             sql += "AND d.source_kind != 'wiki' "
 
-        sql += "ORDER BY rank LIMIT ?"
+        sql += order_sql
         params.append(limit)
 
         cursor = await self._db.execute(sql, params)

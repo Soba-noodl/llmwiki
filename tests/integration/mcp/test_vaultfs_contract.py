@@ -175,6 +175,103 @@ class TestSearch:
         results = await instance.search_chunks(kb_id, "searchterm", 2)
         assert len(results) <= 2
 
+    async def test_search_chunks_finds_two_character_cjk(self, fs, insert_chunk):
+        """FTS5's trigram tokenizer cannot match a term under 3 characters, and
+        two-character compounds are the commonest Japanese word form."""
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "jp.md", "JP", "/", "md", "\u5263\u9053", ["tag"])
+        await instance.create_document(kb_id, "other.md", "Other", "/", "md", "unrelated", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "\u65e5\u672c\u5263\u9053\u5f62\u306f\u5341\u672c\u3042\u308b")
+
+        results = await instance.search_chunks(kb_id, "\u5263\u9053", 10)
+        assert len(results) == 1
+        assert "\u5263\u9053" in results[0]["content"]
+
+    async def test_search_chunks_short_query_does_not_match_everything(self, fs, insert_chunk):
+        instance, kb_id = fs
+        hit = await instance.create_document(kb_id, "hit.md", "Hit", "/", "md", "x", ["tag"])
+        miss = await instance.create_document(kb_id, "miss.md", "Miss", "/", "md", "y", ["tag"])
+        await insert_chunk(str(hit["id"]), kb_id, "\u67f3\u751f\u5b97\u53b3")
+        await insert_chunk(str(miss["id"]), kb_id, "no japanese here")
+
+        results = await instance.search_chunks(kb_id, "\u67f3\u751f", 10)
+        assert [r["filename"] for r in results] == ["hit.md"]
+
+    async def test_search_chunks_short_query_escapes_like_wildcards(self, fs, insert_chunk):
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "pct.md", "Pct", "/", "md", "x", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "literal text with no percent sign")
+
+        assert await instance.search_chunks(kb_id, "%", 10) == []
+        assert await instance.search_chunks(kb_id, "_", 10) == []
+
+    async def test_search_chunks_mixed_query_still_uses_fts(self, fs, insert_chunk):
+        """One long term is enough for the index; the short one is FTS5's to drop."""
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "mix.md", "Mix", "/", "md", "x", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "Yagy\u016b Munetoshi, \u67f3\u751f")
+
+        results = await instance.search_chunks(kb_id, "\u67f3\u751f Munetoshi", 10)
+        assert len(results) >= 1
+
+    async def test_search_chunks_short_or_query_matches_either(self, fs, insert_chunk):
+        """An all-short OR query must not silently AND its terms together."""
+        instance, kb_id = fs
+        a = await instance.create_document(kb_id, "a.md", "A", "/", "md", "x", ["tag"])
+        b = await instance.create_document(kb_id, "b.md", "B", "/", "md", "y", ["tag"])
+        c = await instance.create_document(kb_id, "c.md", "C", "/", "md", "z", ["tag"])
+        await insert_chunk(str(a["id"]), kb_id, "\u65e5\u672c\u306e\u8a71")
+        await insert_chunk(str(b["id"]), kb_id, "\u5263\u9053\u306e\u8a71")
+        await insert_chunk(str(c["id"]), kb_id, "nothing relevant")
+
+        results = await instance.search_chunks(kb_id, "\u65e5\u672c OR \u5263\u9053", 10)
+        assert sorted(r["filename"] for r in results) == ["a.md", "b.md"]
+
+    async def test_search_chunks_short_and_query_requires_both(self, fs, insert_chunk):
+        instance, kb_id = fs
+        both = await instance.create_document(kb_id, "both.md", "Both", "/", "md", "x", ["tag"])
+        one = await instance.create_document(kb_id, "one.md", "One", "/", "md", "y", ["tag"])
+        await insert_chunk(str(both["id"]), kb_id, "\u65e5\u672c\u3068\u5263\u9053")
+        await insert_chunk(str(one["id"]), kb_id, "\u65e5\u672c\u3060\u3051")
+
+        results = await instance.search_chunks(kb_id, "\u65e5\u672c \u5263\u9053", 10)
+        assert [r["filename"] for r in results] == ["both.md"]
+
+    async def test_search_chunks_leaves_fts_syntax_to_fts(self, fs, insert_chunk):
+        """A quoted phrase or a NEAR/NOT query asks for the query language, not a scan."""
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "q.md", "Q", "/", "md", "x", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "\u5263\u9053 and more text")
+
+        # Quoted: handed to FTS5, which cannot serve it — zero, not a scan.
+        assert await instance.search_chunks(kb_id, '"\u5263\u9053"', 10) == []
+
+    async def test_search_chunks_short_query_respects_and_or_precedence(self, fs, insert_chunk):
+        """FTS5 binds AND tighter than OR: `a b OR c` is `(a AND b) OR c`."""
+        instance, kb_id = fs
+        both = await instance.create_document(kb_id, "both.md", "Both", "/", "md", "x", ["tag"])
+        half = await instance.create_document(kb_id, "half.md", "Half", "/", "md", "y", ["tag"])
+        third = await instance.create_document(kb_id, "third.md", "Third", "/", "md", "z", ["tag"])
+        await insert_chunk(str(both["id"]), kb_id, "\u5263\u9053\u3068\u67f3\u751f")
+        await insert_chunk(str(half["id"]), kb_id, "\u5263\u9053\u3060\u3051")
+        await insert_chunk(str(third["id"]), kb_id, "\u8599\u5200\u3060\u3051")
+
+        # 剣道 柳生 OR 薙刀  ==  (剣道 AND 柳生) OR 薙刀 — half.md must NOT match.
+        results = await instance.search_chunks(
+            kb_id, "\u5263\u9053 \u67f3\u751f OR \u8599\u5200", 10
+        )
+        assert sorted(r["filename"] for r in results) == ["both.md", "third.md"]
+
+    async def test_search_chunks_stray_operator_goes_to_fts(self, fs, insert_chunk):
+        """A doubled or dangling operator is a query error; do not silently reinterpret it."""
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "d.md", "D", "/", "md", "x", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "\u5263\u9053 \u67f3\u751f")
+
+        for bad in ("\u5263\u9053 AND OR \u67f3\u751f", "OR \u5263\u9053", "\u5263\u9053 OR"):
+            with pytest.raises(Exception):
+                await instance.search_chunks(kb_id, bad, 10)
+
     async def test_search_chunks_wiki_filter(self, fs, insert_chunk):
         instance, kb_id = fs
         src = await instance.create_document(kb_id, "src.md", "Src", "/", "md", "data", ["tag"])
